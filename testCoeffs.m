@@ -42,7 +42,7 @@ pti   = pti(mask);
 tGrid = tGrid(mask);
 
 %% Apply Coefficients
-forceEst = lcMat * coeffs(:);
+forceEst = lcMat * coeffs(1:4)' + coeffs(5);
 
 %% Compute Error
 err    = forceEst - pti;
@@ -51,6 +51,7 @@ maxErr = max(abs(err));
 
 fprintf('RMSE:      %.4f\n', rmse);
 fprintf('Max Error: %.4f\n', maxErr);
+fprintf('Mean Error: %.4f lbf\n', mean(abs(pti - forceEst)));
 
 figure(3)
 plot(tGrid, pti,      'k',  'DisplayName', 'PT (actual, lbf)')

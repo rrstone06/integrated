@@ -28,7 +28,7 @@ t3  = parseDT(LC3.time);
 t4  = parseDT(LC4.time);
 tPT = parseDT(PT.time);
 
-% Convert to seconds (numeric) for interpolation
+% Convert to seconds
 t1s  = seconds(t1  - t1(1));
 t2s  = seconds(t2  - t1(1));
 t3s  = seconds(t3  - t1(1));
@@ -36,7 +36,7 @@ t4s  = seconds(t4  - t1(1));
 tPTs = seconds(tPT - t1(1));
 
 % Use LC1 as reference, find indices where all others have a real point within tolerance
-tol = 0.01; % 10ms tolerance
+tol = 0.01;
 keepIdx = false(length(t1s), 1);
 lc2Val = zeros(length(t1s),1); lc3Val = zeros(length(t1s),1);
 lc4Val = zeros(length(t1s),1); ptVal  = zeros(length(t1s),1);
@@ -57,7 +57,7 @@ for i = 1:length(t1s)
 end
 
 % Trim to matched rows only
-t1s    = t1s(keepIdx);
+tGrid  = t1s(keepIdx);
 lc1Val = LC1.LC1(keepIdx);
 lc2Val = lc2Val(keepIdx);
 lc3Val = lc3Val(keepIdx);
@@ -66,7 +66,6 @@ ptVal  = ptVal(keepIdx);
 
 cellData = [lc1Val, lc2Val, lc3Val, lc4Val];
 PT_vec   = ptVal .* 4.98;
-tGrid    = t1s;
 
 fprintf('Matched rows: %d\n', sum(keepIdx));
 
@@ -76,99 +75,75 @@ cellData = cellData(mask, :);
 PT_vec   = PT_vec(mask);
 tGrid    = tGrid(mask);
 
-%% Solve for Coefficients
-lc1Coeff = [];
-lc2Coeff = [];
-lc3Coeff = [];
-lc4Coeff = [];
-skipped  = 0;
+%% Solve as Overdetermined Least Squares (all data at once)
+coeffs_with_bias = [cellData, ones(size(cellData,1),1)] \ PT_vec;
+coeffs = coeffs_with_bias(1:4);
+bias   = coeffs_with_bias(5);
 
-step      = 1;   % rows apart within a group
-groupStep = 4;   % move to next group every 4 rows
-i = 1;
-while i + 3*step <= length(cellData)
-    idx = [i, i+step, i+2*step, i+3*step];
-    eqns        = cellData(idx, :);
-    forceTotals = PT_vec(idx);
+fprintf('LC1 coefficient (initial): %.6f\n', coeffs(1));
+fprintf('LC2 coefficient (initial): %.6f\n', coeffs(2));
+fprintf('LC3 coefficient (initial): %.6f\n', coeffs(3));
+fprintf('LC4 coefficient (initial): %.6f\n', coeffs(4));
+fprintf('Bias (initial):            %.4f lbf\n', bias);
 
-    if rcond(eqns) < 1e-12
-        skipped = skipped + 1;
-        i = i + groupStep;
-        continue
-    end
+%% Remove Outlier Rows (beyond 3 std dev of residuals)
+residuals   = PT_vec - (cellData * coeffs + bias);
+outlierMask = abs(residuals - mean(residuals)) <= 3 * std(residuals);
+cellData    = cellData(outlierMask, :);
+PT_vec      = PT_vec(outlierMask);
+tGrid       = tGrid(outlierMask);
 
-    tempCoeff = inv(eqns) * forceTotals;
+fprintf('Removed %d outlier rows (%.1f%%)\n', sum(~outlierMask), 100*mean(~outlierMask));
 
-    lc1Coeff = [lc1Coeff; tempCoeff(1)];
-    lc2Coeff = [lc2Coeff; tempCoeff(2)];
-    lc3Coeff = [lc3Coeff; tempCoeff(3)];
-    lc4Coeff = [lc4Coeff; tempCoeff(4)];
+% Re-solve with cleaned data
+coeffs_with_bias = [cellData, ones(size(cellData,1),1)] \ PT_vec;
+coeffs = coeffs_with_bias(1:4);
+bias   = coeffs_with_bias(5);
 
-    i = i + groupStep;
-end
+fprintf('LC1 coefficient (cleaned): %.6f\n', coeffs(1));
+fprintf('LC2 coefficient (cleaned): %.6f\n', coeffs(2));
+fprintf('LC3 coefficient (cleaned): %.6f\n', coeffs(3));
+fprintf('LC4 coefficient (cleaned): %.6f\n', coeffs(4));
+fprintf('Bias (cleaned):            %.4f lbf\n', bias);
 
-fprintf('Skipped %d singular groups out of %d total\n', skipped, floor(length(cellData)/groupStep));
-
-%% Floating Average for Each Coefficient
-windowSize = 50;
-
-lc1Avg = movmean(lc1Coeff, windowSize);
-lc2Avg = movmean(lc2Coeff, windowSize);
-lc3Avg = movmean(lc3Coeff, windowSize);
-lc4Avg = movmean(lc4Coeff, windowSize);
-
-fprintf('LC1 mean coefficient: %.6f\n', mean(lc1Coeff));
-fprintf('LC2 mean coefficient: %.6f\n', mean(lc2Coeff));
-fprintf('LC3 mean coefficient: %.6f\n', mean(lc3Coeff));
-fprintf('LC4 mean coefficient: %.6f\n', mean(lc4Coeff));
-
-%% Floating Average by Thrust Range
-binEdges = linspace(0, 10500, 8);
+%% Solve by Thrust Range
+binEdges  = linspace(0, 10500, 8);
 binLabels = {};
-rangeCoeffs = zeros(7, 4);
-
-ptGroups = PT_vec(1:groupStep:end);
-ptGroups = ptGroups(1:length(lc1Coeff));
-x = (1:length(lc1Coeff))';
+rangeCoeffs = zeros(7, 5); % 4 LC coeffs + bias
 
 for b = 1:7
     lo = binEdges(b);
     hi = binEdges(b+1);
 
-    binMask = ptGroups >= lo & ptGroups < hi;
+    binMask = PT_vec >= lo & PT_vec < hi;
     binLabels{b} = sprintf('%.0f-%.0f lbf', lo, hi);
 
-    if sum(binMask) < 2
+    if sum(binMask) < 4
         fprintf('Bin %d (%.0f-%.0f lbf): not enough data\n', b, lo, hi);
         continue
     end
 
-    rangeCoeffs(b, :) = [mean(lc1Coeff(binMask)), mean(lc2Coeff(binMask)), ...
-                          mean(lc3Coeff(binMask)), mean(lc4Coeff(binMask))];
+    binData   = cellData(binMask, :);
+    binCoeffs = [binData, ones(size(binData,1),1)] \ PT_vec(binMask);
+    rangeCoeffs(b, :) = binCoeffs';
 
     fprintf('Bin %d (%.0f-%.0f lbf):\n', b, lo, hi);
-    fprintf('  LC1: %.6f  LC2: %.6f  LC3: %.6f  LC4: %.6f\n', ...
-        rangeCoeffs(b,1), rangeCoeffs(b,2), rangeCoeffs(b,3), rangeCoeffs(b,4));
+    fprintf('  LC1: %.6f  LC2: %.6f  LC3: %.6f  LC4: %.6f  Bias: %.4f\n', ...
+        binCoeffs(1), binCoeffs(2), binCoeffs(3), binCoeffs(4), binCoeffs(5));
 end
 
-%% Plot Coefficients Over Time
-tCoeff = tGrid(1:groupStep:end);
-tCoeff = tCoeff(1:length(lc1Coeff));
-
+%% Plot LC values and PT over time
 figure(1)
-plot(tCoeff, lc1Coeff)
+plot(tGrid, cellData(:,1))
 hold on
-plot(tCoeff, lc2Coeff)
-plot(tCoeff, lc3Coeff)
-plot(tCoeff, lc4Coeff)
-plot(tCoeff, lc1Avg, 'b--')
-plot(tCoeff, lc2Avg, 'r--')
-plot(tCoeff, lc3Avg, 'g--')
-plot(tCoeff, lc4Avg, 'm--')
-legend('LC1','LC2','LC3','LC4','LC1 avg','LC2 avg','LC3 avg','LC4 avg')
+plot(tGrid, cellData(:,2))
+plot(tGrid, cellData(:,3))
+plot(tGrid, cellData(:,4))
+plot(tGrid, PT_vec, 'k--')
+legend('LC1 (lbf)','LC2 (lbf)','LC3 (lbf)','LC4 (lbf)','PT (lbf)')
 xlabel('Time (s)')
-ylabel('Coefficient (dimensionless)')
-title('Load Cell Coefficients Over Time')
+ylabel('Force (lbf)')
+title('Raw LC and PT Values Over Time')
 
 %% Plot Coefficients by Thrust Range
 lcNames = {'LC1','LC2','LC3','LC4'};
@@ -185,5 +160,4 @@ end
 sgtitle('Load Cell Coefficients by Thrust Range (lbf)')
 
 %% Test Coefficients
-bestCoeffs = [mean(lc1Coeff), mean(lc2Coeff), mean(lc3Coeff), mean(lc4Coeff)];
-testCoeffs(bestCoeffs, 'integrated_1ms.csv')
+testCoeffs([coeffs; bias]', 'integrated_1ms.csv')
