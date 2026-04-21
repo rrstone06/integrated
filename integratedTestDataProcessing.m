@@ -65,7 +65,7 @@ lc4Val = lc4Val(keepIdx);
 ptVal  = ptVal(keepIdx);
 
 cellData = [lc1Val, lc2Val, lc3Val, lc4Val];
-PT_vec   = ptVal .* 4.98;
+PT_vec   = ptVal .* (((2.52/2)^2)*pi);
 
 fprintf('Matched rows: %d\n', sum(keepIdx));
 
@@ -75,43 +75,90 @@ cellData = cellData(mask, :);
 PT_vec   = PT_vec(mask);
 tGrid    = tGrid(mask);
 
-%% Solve as Overdetermined Least Squares (all data at once)
-coeffs_with_bias = [cellData, ones(size(cellData,1),1)] \ PT_vec;
-coeffs = coeffs_with_bias(1:4);
-bias   = coeffs_with_bias(5);
+% Time mask — exclude idle period between tests
+tMin = 1200;  % seconds
+tMax = 1400;  % seconds
+timeMask = ~(tGrid >= tMin & tGrid <= tMax);
+cellData = cellData(timeMask, :);
+PT_vec   = PT_vec(timeMask);
+tGrid    = tGrid(timeMask);
+fprintf('Rows after time mask: %d\n', sum(timeMask));
 
-fprintf('LC1 coefficient (initial): %.6f\n', coeffs(1));
-fprintf('LC2 coefficient (initial): %.6f\n', coeffs(2));
-fprintf('LC3 coefficient (initial): %.6f\n', coeffs(3));
-fprintf('LC4 coefficient (initial): %.6f\n', coeffs(4));
-fprintf('Bias (initial):            %.4f lbf\n', bias);
+%% Split into peaks by time gaps
+dt        = diff(tGrid);
+gapThresh = 1.0;
+gapIdx    = find(dt > gapThresh);
 
-%% Remove Outlier Rows (beyond 3 std dev of residuals)
-residuals   = PT_vec - (cellData * coeffs + bias);
-outlierMask = abs(residuals - mean(residuals)) <= 3 * std(residuals);
-cellData    = cellData(outlierMask, :);
-PT_vec      = PT_vec(outlierMask);
-tGrid       = tGrid(outlierMask);
+segStarts = [1; gapIdx+1];
+segEnds   = [gapIdx; length(tGrid)];
 
-fprintf('Removed %d outlier rows (%.1f%%)\n', sum(~outlierMask), 100*mean(~outlierMask));
+fprintf('Found %d peaks\n', length(segStarts));
 
-% Re-solve with cleaned data
-coeffs_with_bias = [cellData, ones(size(cellData,1),1)] \ PT_vec;
-coeffs = coeffs_with_bias(1:4);
-bias   = coeffs_with_bias(5);
+peakCoeffs = zeros(length(segStarts), 5);
 
-fprintf('LC1 coefficient (cleaned): %.6f\n', coeffs(1));
-fprintf('LC2 coefficient (cleaned): %.6f\n', coeffs(2));
-fprintf('LC3 coefficient (cleaned): %.6f\n', coeffs(3));
-fprintf('LC4 coefficient (cleaned): %.6f\n', coeffs(4));
-fprintf('Bias (cleaned):            %.4f lbf\n', bias);
+for p = 1:length(segStarts)
+    idx   = segStarts(p):segEnds(p);
+    cdSeg = cellData(idx, :);
+    ptSeg = PT_vec(idx);
+    tSeg  = tGrid(idx);
+
+    fprintf('\n--- Peak %d (%d rows, t=%.1f to %.1f s) ---\n', ...
+        p, length(idx), tSeg(1), tSeg(end));
+
+    % Initial solve
+    cb = [cdSeg, ones(size(cdSeg,1),1)] \ ptSeg;
+
+    % Remove outliers
+    res   = ptSeg - (cdSeg * cb(1:4) + cb(5));
+    omask = abs(res - mean(res)) <= 3 * std(res);
+    cdSeg = cdSeg(omask, :);
+    ptSeg = ptSeg(omask);
+
+    fprintf('Removed %d outliers (%.1f%%)\n', sum(~omask), 100*mean(~omask));
+
+    % Re-solve
+    cb = [cdSeg, ones(size(cdSeg,1),1)] \ ptSeg;
+    peakCoeffs(p,:) = cb';
+
+    % Error metrics
+    est = cdSeg * cb(1:4) + cb(5);
+    fprintf('LC1: %.6f  LC2: %.6f  LC3: %.6f  LC4: %.6f  Bias: %.4f\n', ...
+        cb(1), cb(2), cb(3), cb(4), cb(5));
+    fprintf('RMSE: %.4f lbf  Max: %.4f lbf  Mean: %.4f lbf\n', ...
+        sqrt(mean((ptSeg-est).^2)), max(abs(ptSeg-est)), mean(abs(ptSeg-est)));
+
+    % Plot peak fit
+    figure(2 + p)
+    plot(tSeg(omask), ptSeg, 'k', 'DisplayName', 'PT (actual)')
+    hold on
+    plot(tSeg(omask), est, 'r--', 'DisplayName', 'LC estimate')
+    plot(tSeg(omask), ptSeg - est, 'b', 'DisplayName', 'Residual')
+    yline(0, 'k--')
+    legend
+    xlabel('Time (s)')
+    ylabel('Force (lbf)')
+    title(sprintf('Peak %d Fit  |  RMSE: %.1f lbf  Mean: %.1f lbf', ...
+        p, sqrt(mean((ptSeg-est).^2)), mean(abs(ptSeg-est))))
+end
+
+%% Average coefficients across peaks
+if size(peakCoeffs, 1) == 1
+    coeffs = peakCoeffs(1, 1:4)';
+    bias   = peakCoeffs(1, 5);
+else
+    coeffs = mean(peakCoeffs(:,1:4))';
+    bias   = mean(peakCoeffs(:,5));
+end
+fprintf('\n--- Average across peaks ---\n');
+fprintf('LC1: %.6f  LC2: %.6f  LC3: %.6f  LC4: %.6f  Bias: %.4f lbf\n', ...
+    coeffs(1), coeffs(2), coeffs(3), coeffs(4), bias);
 
 %% Solve by Thrust Range
-binEdges  = linspace(0, 10500, 8);
-binLabels = {};
-rangeCoeffs = zeros(7, 5); % 4 LC coeffs + bias
+binEdges    = linspace(5500, 10500, 6);
+binLabels   = {};
+rangeCoeffs = zeros(5, 5);
 
-for b = 1:7
+for b = 1:5
     lo = binEdges(b);
     hi = binEdges(b+1);
 
@@ -133,13 +180,24 @@ for b = 1:7
 end
 
 %% Plot LC values and PT over time
+dt_plot = diff(tGrid);
+gapMask = [false; dt_plot > 1.0];
+
+tPlot  = tGrid;
+cdPlot = cellData;
+ptPlot = PT_vec;
+
+tPlot(gapMask)    = NaN;
+cdPlot(gapMask,:) = NaN;
+ptPlot(gapMask)   = NaN;
+
 figure(1)
-plot(tGrid, cellData(:,1))
+plot(tPlot, cdPlot(:,1))
 hold on
-plot(tGrid, cellData(:,2))
-plot(tGrid, cellData(:,3))
-plot(tGrid, cellData(:,4))
-plot(tGrid, PT_vec, 'k--')
+plot(tPlot, cdPlot(:,2))
+plot(tPlot, cdPlot(:,3))
+plot(tPlot, cdPlot(:,4))
+plot(tPlot, ptPlot, 'k--')
 legend('LC1 (lbf)','LC2 (lbf)','LC3 (lbf)','LC4 (lbf)','PT (lbf)')
 xlabel('Time (s)')
 ylabel('Force (lbf)')
