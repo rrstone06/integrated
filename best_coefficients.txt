@@ -1,0 +1,14 @@
+Best Coefficients — Firing 4
+=====================================
+LC1:  1.456201
+LC2:  0.815922
+LC3:  1.273618
+LC4:  0.224549
+Bias: 279.7953 lbf
+
+--- Operational Range (0-7000 lbf, rising, d1<50) ---
+RMSE:       136.67 lbf
+Max Error:  1058.96 lbf
+Mean Error: 78.51 lbf
+Mean Error (% of 7000 lbf nominal): 1.12%
+RMSE (% of 7000 lbf nominal): 1.95%
